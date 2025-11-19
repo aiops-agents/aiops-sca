@@ -86,31 +86,11 @@ inputs:
     required: false
     default: "4000"
 
-  # New attributes
+  # Advanced analysis knobs
   lint_retry_on_failure:
     description: "Retry the LLM once if it returns invalid JSON"
     required: false
     default: "true"
-  re_lint_after_apply:
-    description: "Run a re-lint step after applying changes (requires re_lint_cmd)"
-    required: false
-    default: "false"
-  re_lint_cmd:
-    description: "Shell command to execute a linter after apply (it must output JSON files)"
-    required: false
-    default: ""
-  re_lint_output_glob:
-    description: "Glob pattern for the re-lint JSON outputs to parse"
-    required: false
-    default: ""
-  pr_title:
-    description: "PR title when apply_mode=pr"
-    required: false
-    default: "AIOps SCA: Auto-fix Terraform lint issues"
-  pr_body:
-    description: "PR body when apply_mode=pr"
-    required: false
-    default: "This PR was opened by AIOps SCA agent to address Terraform static analysis issues."
   allow_severities:
     description: 'JSON array of severities to consider (e.g., ["low","medium","high","critical","warning","error"])'
     required: false
@@ -127,6 +107,78 @@ inputs:
     description: "Write prompt/response audit logs to output_dir/audit (secrets redacted)"
     required: false
     default: "true"
+
+  # SARIF (aggregated)
+  sarif_output_enabled:
+    description: "Generate aggregated SARIF output files"
+    required: false
+    default: "true"
+  sarif_pre_path:
+    description: "Aggregated SARIF path for pre-fix issues"
+    required: false
+    default: "output/aiops-sca.sarif"
+  sarif_post_path:
+    description: "Aggregated SARIF path for post-fix (re-lint) issues"
+    required: false
+    default: "output/aiops-sca-post.sarif"
+
+  # Tool-specific SARIF
+  tool_sarif_enabled:
+    description: "Generate separate SARIF files per tool"
+    required: false
+    default: "true"
+  tool_sarif_mode:
+    description: "convert|native for pre-fix SARIF (use native if existing, else convert)"
+    required: false
+    default: "convert"
+  tool_sarif_dir:
+    description: "Directory for pre-fix per-tool SARIF (tflint.sarif/tfsec.sarif/checkov.sarif)"
+    required: false
+    default: "output/sarif"
+  tool_sarif_post_mode:
+    description: "convert|native for post-fix SARIF when re-linting"
+    required: false
+    default: "native"
+  tool_sarif_post_dir:
+    description: "Directory for post-fix per-tool SARIF"
+    required: false
+    default: "output/sarif-post"
+
+  # Built-in re-linting
+  re_lint_after_apply:
+    description: "Run re-lint after applying changes using built-in tools or custom"
+    required: false
+    default: "false"
+  re_lint_tooling:
+    description: "built-in|custom (built-in uses baked tflint/tfsec/checkov)"
+    required: false
+    default: "built-in"
+  re_lint_tools:
+    description: 'JSON array of tools to run: ["tflint","tfsec","checkov"]'
+    required: false
+    default: '["tflint","tfsec","checkov"]'
+  re_lint_cmd:
+    description: "If re_lint_tooling=custom, shell command to execute"
+    required: false
+    default: ""
+  re_lint_output_glob:
+    description: "If re_lint_tooling=custom, glob pattern for JSON outputs"
+    required: false
+    default: ""
+
+  # Patch outputs
+  patches_enabled:
+    description: "Write unified diff patches for proposed/applied changes"
+    required: false
+    default: "true"
+  patches_dir:
+    description: "Directory to write patch files"
+    required: false
+    default: "output/patches"
+  combined_patch_name:
+    description: "Filename for combined patch"
+    required: false
+    default: "changes.patch"
 
 runs:
   using: "docker"
