@@ -6,7 +6,7 @@
 **Usages**
 ```
 - name: AIOps SCA Agent
-        uses: ai-agents/aiops-sca@v1
+        uses: aiops-agents/aiops-sca@v1
         with:
           enable: true
           scope: '["infra/**/*.tf"]'
