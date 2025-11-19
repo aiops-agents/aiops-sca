@@ -7,7 +7,8 @@ import subprocess
 import pathlib
 import difflib
 from typing import List, Dict, Any, Tuple, Optional
-from jsonschema import validate as json_validate, ValidationError
+from jsonschema import ValidationError
+import requests
 
 # LLM SDK
 try:
@@ -44,20 +45,14 @@ def parse_json_or_csv(s: str) -> List[str]:
 def ensure_dir(path: str):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
 
-def within_scope(path: str, scope_globs: List[str]) -> bool:
-    p = pathlib.Path(path).as_posix()
-    for pattern in scope_globs:
-        if any(pathlib.Path(x).as_posix() == p for x in glob.glob(pattern, recursive=True)):
-            return True
-        # glob may not handle some recursive comparisons directly here—fallback:
-        if fnmatchcase(p, pattern):
-            return True
-    return False
-
 def fnmatchcase(path: str, pattern: str) -> bool:
-    # Convert glob to regex
-    # Handle ** by translating to .*
-    pattern = pattern.replace(".", r"\.").replace("**/", r"(.*/)?").replace("**", r".*").replace("*", r"[^/]*").replace("?", r".")
+    # Convert glob to regex with support for ** and *
+    pattern = re.escape(pattern)
+    # restore wildcards
+    pattern = pattern.replace(r"\*\*/", r"(.*/)?")
+    pattern = pattern.replace(r"\*\*", r".*")
+    pattern = pattern.replace(r"\*", r"[^/]*")
+    pattern = pattern.replace(r"\?", r".")
     pattern = "^" + pattern + "$"
     return re.match(pattern, path) is not None
 
@@ -69,21 +64,42 @@ def list_tf_files(scope_globs: List[str]) -> List[str]:
                 files.add(pathlib.Path(f).as_posix())
     return sorted(files)
 
+# ------------- Redaction / audit -------------
+
+SECRET_KEYS = ["KEY", "TOKEN", "PASSWORD", "SECRET"]
+
+def redact_secrets(text: str) -> str:
+    if not text:
+        return text
+    redacted = text
+    # Basic heuristic: redact env var values for keys that look sensitive
+    for k, v in os.environ.items():
+        if any(tag in k.upper() for tag in SECRET_KEYS):
+            if v and isinstance(v, str) and len(v) >= 6:
+                redacted = redacted.replace(v, "[REDACTED]")
+    return redacted
+
+def audit_write(output_dir: str, file_path: str, payload: Dict[str, Any]):
+    try:
+        audit_dir = os.path.join(output_dir, "audit")
+        ensure_dir(audit_dir)
+        safe_name = pathlib.Path(file_path).name.replace("/", "_")
+        out_path = os.path.join(audit_dir, f"{safe_name}.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(redact_secrets(json.dumps(payload, indent=2)))
+    except Exception as e:
+        gh_print(f"::warning::Failed audit write for {file_path}: {e}")
+
 # ------------- Lint parsing -------------
 
 def detect_lint_format(payload: Any) -> str:
-    # Heuristics
     if isinstance(payload, dict):
         if "issues" in payload and isinstance(payload["issues"], list):
-            # tflint likely
             return "tflint"
-        if "results" in payload and isinstance(payload["results"], list) and any("rule_id" in r or "rule" in r for r in payload["results"]):
-            # tfsec likely
+        if "results" in payload and isinstance(payload["results"], list) and any(isinstance(r, dict) and ("rule_id" in r or "rule" in r) for r in payload["results"]):
             return "tfsec"
         if "check_type" in payload and "results" in payload:
-            # Checkov-like
             return "checkov"
-    # Fallback unknown
     return "unknown"
 
 def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[Dict[str, Any]]:
@@ -98,53 +114,48 @@ def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[D
 
     issues = []
     if fmt == "tflint":
-        # TFLint JSON has { "issues": [ { "rule": "...", "message": "...", "range": { "filename": "...", "start": {"line":...} ... } } ] }
         for it in payload.get("issues", []):
-            file_path = (it.get("range", {}) or {}).get("filename", "")
-            start = ((it.get("range", {}) or {}).get("start", {}) or {}).get("line", None)
-            end = ((it.get("range", {}) or {}).get("end", {}) or {}).get("line", start)
+            r = it.get("range", {}) or {}
+            start = (r.get("start", {}) or {}).get("line", None)
+            end = (r.get("end", {}) or {}).get("line", start)
             issues.append({
                 "tool": "tflint",
                 "rule_id": it.get("rule", ""),
                 "message": it.get("message", ""),
-                "severity": it.get("severity", "warning"),
-                "file_path": file_path,
+                "severity": (it.get("severity", "warning") or "").lower(),
+                "file_path": (r.get("filename", "") or "").lstrip("./"),
                 "start_line": start,
                 "end_line": end,
             })
     elif fmt == "tfsec":
-        # tfsec JSON often contains results with fields: rule_id, impact, resolution, description, location.filename, start_line
         for res in payload.get("results", []):
             loc = res.get("location", {}) or {}
-            file_path = loc.get("filename", "")
             start = loc.get("start_line", None)
             end = loc.get("end_line", start)
             issues.append({
                 "tool": "tfsec",
                 "rule_id": res.get("rule_id", ""),
                 "message": res.get("description", ""),
-                "severity": res.get("severity", "MEDIUM"),
-                "file_path": file_path,
+                "severity": (res.get("severity", "medium") or "").lower(),
+                "file_path": (loc.get("filename", "") or "").lstrip("./"),
                 "start_line": start,
                 "end_line": end,
                 "resolution": res.get("resolution", ""),
                 "impact": res.get("impact", ""),
             })
     elif fmt == "checkov":
-        # Checkov JSON: results.failed_checks list with filename, file_line_range, check_id, check_name, severity
         res = payload.get("results", {}) or {}
         for fc in res.get("failed_checks", []):
-            file_path = (fc.get("file_path", "") or "").lstrip("./")
-            start, end = None, None
             rng = fc.get("file_line_range")
+            start, end = None, None
             if isinstance(rng, list) and len(rng) == 2:
                 start, end = rng
             issues.append({
                 "tool": "checkov",
                 "rule_id": fc.get("check_id", ""),
                 "message": fc.get("check_name", ""),
-                "severity": fc.get("severity", "MEDIUM"),
-                "file_path": file_path,
+                "severity": (fc.get("severity", "medium") or "").lower(),
+                "file_path": (fc.get("file_path", "") or "").lstrip("./"),
                 "start_line": start,
                 "end_line": end,
                 "guideline": fc.get("guideline", ""),
@@ -208,25 +219,38 @@ Output strict JSON with this schema:
 No markdown, no comments outside JSON.
 """
 
-def llm_propose_new_content(client, provider: str, model: str, file_path: str, file_text: str, issues: List[Dict[str, Any]], temperature: float, max_tokens: int) -> Optional[Dict[str, Any]]:
-    user_prompt = {
-        "role": "user",
-        "content": json.dumps({
-            "file_path": file_path,
-            "file_content": file_text,
-            "issues": issues
-        }, ensure_ascii=False)
+def parse_json_strict(s: str) -> Optional[Dict[str, Any]]:
+    try:
+        return json.loads(s)
+    except Exception:
+        # Attempt to extract first top-level JSON object
+        start = s.find("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            candidate = s[start:end+1]
+            try:
+                return json.loads(candidate)
+            except Exception:
+                return None
+        return None
+
+def llm_propose_new_content(client, provider: str, model: str, file_path: str, file_text: str, issues: List[Dict[str, Any]], temperature: float, max_tokens: int, audit: bool, output_dir: str, lint_retry: bool) -> Optional[Dict[str, Any]]:
+    user_payload = {
+        "file_path": file_path,
+        "file_content": file_text,
+        "issues": issues
     }
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}
+    ]
     try:
         if provider == "azure_openai":
             resp = client.chat.completions.create(
-                model=model,  # For Azure this is the deployment name
+                model=model,  # Azure deployment name
                 temperature=temperature,
                 max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    user_prompt
-                ]
+                messages=messages
             )
             content = resp.choices[0].message.content
         else:
@@ -234,14 +258,45 @@ def llm_propose_new_content(client, provider: str, model: str, file_path: str, f
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    user_prompt
-                ]
+                messages=messages
             )
             content = resp.choices[0].message.content
-        # Expect strict JSON
-        return json.loads(content)
+
+        if audit:
+            audit_write(output_dir, file_path, {
+                "request": {"messages": messages, "model": model},
+                "response_raw": redact_secrets(content or "")
+            })
+
+        parsed = parse_json_strict(content or "")
+        if not parsed and lint_retry:
+            gh_print(f"::notice::Retrying LLM for {file_path} due to invalid JSON.")
+            if provider == "azure_openai":
+                resp = client.chat.completions.create(
+                    model=model,
+                    temperature=max(0.1, temperature - 0.1),
+                    max_tokens=max_tokens,
+                    messages=messages
+                )
+                content = resp.choices[0].message.content
+            else:
+                resp = client.chat.completions.create(
+                    model=model,
+                    temperature=max(0.1, temperature - 0.1),
+                    max_tokens=max_tokens,
+                    messages=messages
+                )
+                content = resp.choices[0].message.content
+
+            if audit:
+                audit_write(output_dir, file_path, {
+                    "request_retry": {"messages": messages, "model": model},
+                    "response_raw_retry": redact_secrets(content or "")
+                })
+
+            parsed = parse_json_strict(content or "")
+
+        return parsed
     except Exception as e:
         gh_print(f"::warning::LLM call failed for {file_path}: {e}")
         return None
@@ -296,13 +351,45 @@ def git_commit(message: str) -> Optional[str]:
         r = git_run(["git", "rev-parse", "HEAD"])
         return r.stdout.strip()
     except subprocess.CalledProcessError as e:
-        if "nothing to commit" in (e.stderr or ""):
+        combined = (e.stdout or "") + (e.stderr or "")
+        if "nothing to commit" in combined.lower():
             gh_print("::notice::No changes to commit.")
             return None
         raise
 
 def git_push(branch: str):
     git_run(["git", "push", "origin", branch])
+
+# ------------- GitHub PR -------------
+
+def create_pull_request(base_branch: str, head_branch: str, title: str, body: str) -> Optional[str]:
+    repo = git_get_repo()
+    token = os.getenv("GITHUB_TOKEN") or ""
+    if not (repo and token):
+        gh_print("::warning::Missing repo or token; cannot create PR.")
+        return None
+    url = f"https://api.github.com/repos/{repo}/pulls"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github+json"
+    }
+    data = {"title": title, "head": head_branch, "base": base_branch, "body": body, "maintainer_can_modify": True}
+    try:
+        resp = requests.post(url, headers=headers, json=data, timeout=30)
+        if resp.status_code == 201:
+            pr = resp.json()
+            gh_print(f"::notice::Opened PR #{pr.get('number')} -> {pr.get('html_url')}")
+            return pr.get("html_url")
+        else:
+            msg = resp.text
+            if "A pull request already exists" in msg or resp.status_code == 422:
+                gh_print("::notice::PR already exists or cannot be created (422).")
+                return None
+            gh_print(f"::warning::Failed to create PR: {resp.status_code} {msg}")
+            return None
+    except Exception as e:
+        gh_print(f"::warning::PR creation failed: {e}")
+        return None
 
 # ------------- Main -------------
 
@@ -332,28 +419,46 @@ def main():
     temperature = float(get_input("temperature", "0.2"))
     max_tokens = int(get_input("max_tokens", "4000"))
 
+    # New inputs
+    lint_retry_on_failure = parse_bool(get_input("lint_retry_on_failure", "true"))
+    re_lint_after_apply = parse_bool(get_input("re_lint_after_apply", "false"))
+    re_lint_cmd = get_input("re_lint_cmd", "")
+    re_lint_output_glob = get_input("re_lint_output_glob", "")
+    pr_title = get_input("pr_title", "AIOps SCA: Auto-fix Terraform lint issues")
+    pr_body = get_input("pr_body", "This PR was opened by AIOps SCA agent to address Terraform static analysis issues.")
+    allow_severities = [s.lower() for s in parse_json_or_csv(get_input("allow_severities", '["low","medium","high","critical","warning","error"]'))]
+    exclude_rules = set(parse_json_or_csv(get_input("exclude_rules", "[]")))
+    max_token_context_bytes = int(get_input("max_token_context_bytes", "0"))
+    audit_log = parse_bool(get_input("audit_log", "true"))
+
     ensure_dir(output_dir)
 
     # Gather issues
-    issues = collect_issues(input_dir, lint_format)
-    gh_print(f"::notice::Collected {len(issues)} lint issues from {input_dir}")
+    issues_raw = collect_issues(input_dir, lint_format)
+    # Filter by severity and excluded rules
+    issues = []
+    for it in issues_raw:
+        sev = (it.get("severity") or "").lower()
+        if allow_severities and sev and sev not in allow_severities:
+            continue
+        if it.get("rule_id") in exclude_rules:
+            continue
+        issues.append(it)
+
+    gh_print(f"::notice::Collected {len(issues)} eligible lint issues from {input_dir} (filtered from {len(issues_raw)})")
 
     files_in_scope = list_tf_files(scope)
     files_in_scope_set = set(files_in_scope)
 
-    # Index issues by file
+    # Index issues by file (only files in scope)
     issues_by_file: Dict[str, List[Dict[str, Any]]] = {}
     for it in issues:
         fp = (it.get("file_path") or "").lstrip("./")
-        if not fp:
-            continue
-        # Only consider issues for files that are in scope
         if fp in files_in_scope_set:
             issues_by_file.setdefault(fp, []).append(it)
 
     if not issues_by_file:
         gh_print("::notice::No issues found for files in scope. Nothing to do.")
-        # Still write an empty report
         with open(os.path.join(output_dir, "report.json"), "w", encoding="utf-8") as f:
             json.dump({"summary": "No issues in scope."}, f, indent=2)
         return
@@ -364,6 +469,7 @@ def main():
     changed_files: List[str] = []
     recommendations: List[Dict[str, Any]] = []
     per_file_results: Dict[str, Any] = {}
+    skipped_large_files: List[str] = []
 
     # Safety: deny changes in protected paths
     def is_protected(p: str) -> bool:
@@ -385,6 +491,11 @@ def main():
             gh_print(f"::warning::Cannot read {fp}: {e}")
             continue
 
+        if max_token_context_bytes and len(original.encode("utf-8")) > max_token_context_bytes:
+            gh_print(f"::warning::{fp}: Skipping due to size > max_token_context_bytes={max_token_context_bytes}")
+            skipped_large_files.append(fp)
+            continue
+
         resp = llm_propose_new_content(
             client=client,
             provider=llm_provider,
@@ -394,6 +505,9 @@ def main():
             issues=file_issues,
             temperature=temperature,
             max_tokens=max_tokens,
+            audit=audit_log,
+            output_dir=output_dir,
+            lint_retry=lint_retry_on_failure,
         )
 
         if not resp or "new_content" not in resp:
@@ -446,13 +560,14 @@ def main():
             "file_path": fp,
             "risk_level": risk_level,
             "summary": [c.get("explanation", "") for c in changes_meta],
-            "severity": [c.get("severity", "") for c in changes_meta],
+            "severity": [str(c.get("severity", "")).lower() for c in changes_meta],
             "edits": total_edits,
         })
 
     # Commit/push if needed
     commit_sha = None
     created_branch = None
+    pr_url = None
 
     if auto_apply and changed_files:
         git_setup_user(git_user_name, git_user_email)
@@ -477,23 +592,45 @@ def main():
                 gh_print(f"::notice::Pushed changes to {target_branch} ({commit_sha})")
             except Exception as e:
                 gh_print(f"::error::Failed to push changes: {e}")
-                # rollback not attempted
+
+            # Optional re-lint after apply (requires command)
+            re_lint_summary = None
+            if re_lint_after_apply and re_lint_cmd.strip():
+                try:
+                    gh_print(f"::notice::Running re-lint command: {re_lint_cmd}")
+                    rl = subprocess.run(re_lint_cmd, shell=True, text=True, capture_output=True)
+                    if rl.returncode != 0:
+                        gh_print(f"::warning::re_lint_cmd returned {rl.returncode}: {rl.stderr}")
+                    else:
+                        gh_print(f"::notice::re_lint_cmd stdout: {rl.stdout[:5000]}")
+                    if re_lint_output_glob.strip():
+                        new_issues = []
+                        for path in glob.glob(re_lint_output_glob.strip(), recursive=True):
+                            new_issues.extend(normalize_issues_from_file(path, lint_format))
+                        re_lint_summary = {"files": len(set([i.get("file_path") for i in new_issues])), "issues": len(new_issues)}
+                        gh_print(f"::notice::Re-lint found {re_lint_summary['issues']} issues across {re_lint_summary['files']} files.")
+                except Exception as e:
+                    gh_print(f"::warning::Re-lint failed: {e}")
+
+            # If apply_mode=pr, attempt to open a PR
+            if apply_mode == "pr" and created_branch and created_branch != current_branch:
+                pr_url = create_pull_request(base_branch=current_branch, head_branch=created_branch, title=pr_title, body=pr_body)
 
     # Write outputs
-    # report.json
     report = {
         "files_in_scope": files_in_scope,
         "issues_considered": len(issues),
         "files_changed": changed_files,
+        "skipped_large_files": skipped_large_files,
         "per_file_results": per_file_results,
         "commit_sha": commit_sha,
         "apply_mode": apply_mode,
-        "auto_apply": auto_apply
+        "auto_apply": auto_apply,
+        "pr_url": pr_url
     }
     with open(os.path.join(output_dir, "report.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2)
 
-    # recommendations
     if show_recommendation:
         if recommendation_format == "json":
             with open(os.path.join(output_dir, "recommendations.json"), "w", encoding="utf-8") as f:
@@ -516,10 +653,8 @@ def main():
     if fail_on_unfixed:
         unresolved_crit = 0
         for fp, res in per_file_results.items():
-            # crude heuristic: if edits==0 but issues existed, we consider unresolved
             if res.get("total_edits", 0) == 0 and len(issues_by_file.get(fp, [])) > 0:
-                # if any severity high/critical
-                severities = [i.get("severity", "").lower() for i in issues_by_file.get(fp, [])]
+                severities = [str(i.get("severity", "")).lower() for i in issues_by_file.get(fp, [])]
                 if any(s in ("high", "critical", "error") for s in severities):
                     unresolved_crit += 1
         if unresolved_crit > 0:
