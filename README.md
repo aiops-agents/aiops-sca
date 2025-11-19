@@ -6,7 +6,7 @@
 **Release v1.0.0:** AIOps Static Code Analysis Agent; **Objective:** "Agentic AI to analyze Terraform lint outputs and optionally auto-fix and push changes"
 
 
-**Usages**
+**Usage:** Please [refer here](https://github.com/aiops-agents/aiops-gh-workflows) for the GitHub workflow usage. 
 ```
 - name: AIOps SCA Agent
   uses: ai-agents/aiops-sca@v1
