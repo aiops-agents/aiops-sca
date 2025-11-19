@@ -1,9 +1,9 @@
 # Open Source Project
 ## **Static Code Analysis (SCA) AI Agent for Infrastructure-as-Code**
 
-**Status:** Underconstruction. For any queries, please reach out to @TheSolutionArchitect.
+**Status:** Testing in-progress. If you have any queries, please reach out to @TheSolutionArchitect.
 
-**Plan A:** AIOps Static Code Analysis Agent; **Objective:** "Agentic AI to analyze Terraform lint outputs and optionally auto-fix and push changes"
+**Release v1.0.0:** AIOps Static Code Analysis Agent; **Objective:** "Agentic AI to analyze Terraform lint outputs and optionally auto-fix and push changes"
 
 
 **Usages**
