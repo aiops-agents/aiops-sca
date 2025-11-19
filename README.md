@@ -1,8 +1,7 @@
 # Open Source Project
-# aiops-sca
-**Static Code Analysis (SCA) AI Agent for Infrastructure-as-Code**
+## **Static Code Analysis (SCA) AI Agent for Infrastructure-as-Code**
 
-**Status:** Underconstruction. For any queries please reachout to @TheSolutionArchitect. 
+**Status:** Underconstruction. For any queries please reachout to @TheSolutionArchitect.
 
 **Usages**
 ```
