@@ -34,7 +34,7 @@ jobs:
           show_recommendation: true
           auto_apply: true
           lint_format: "auto"
-          apply_mode: "pr"                # open a PR with changes
+          apply_mode: "pr"                # dry-run or pr, pr for open a PR with changes
           pr_title: "AIOps SCA: Terraform fixes"
           pr_body: "Automated changes by AIOps SCA. Please review."
           max_lines_changed: "200"
