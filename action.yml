@@ -1,0 +1,93 @@
+name: AIOps Static Code Analysis Agent
+description: "Agentic AI to analyze Terraform lint outputs and optionally auto-fix and push changes"
+author: ai-agents
+branding:
+  icon: shield
+  color: blue
+
+inputs:
+  enable:
+    description: "Enable or disable the AI agent"
+    required: false
+    default: "true"
+  scope:
+    description: 'JSON array of globs, e.g., ["infra/**.tf"]'
+    required: true
+    default: '["**/*.tf"]'
+  input_dir:
+    description: "Directory containing linter outputs (JSON)."
+    required: false
+    default: "./input"
+  output_dir:
+    description: "Directory to write agent outputs."
+    required: false
+    default: "./output"
+  llm_provider:
+    description: "LLM provider: azure_openai or openai"
+    required: false
+    default: "azure_openai"
+  llm_model:
+    description: "Model or deployment name (e.g., gpt-4o-mini)"
+    required: true
+  show_recommendation:
+    description: "Store human-readable recommendations"
+    required: false
+    default: "true"
+  auto_apply:
+    description: "Apply fixes and commit/push"
+    required: false
+    default: "false"
+  lint_format:
+    description: "auto|tflint|tfsec|checkov"
+    required: false
+    default: "auto"
+  apply_mode:
+    description: "commit|pr|dry-run"
+    required: false
+    default: "commit"
+  max_lines_changed:
+    description: "Safety threshold per file"
+    required: false
+    default: "200"
+  max_files_changed:
+    description: "Safety threshold for number of files"
+    required: false
+    default: "10"
+  protected_paths:
+    description: "JSON array of paths that must never be altered"
+    required: false
+    default: "[]"
+  recommendation_format:
+    description: "markdown|json"
+    required: false
+    default: "markdown"
+  fail_on_unfixed:
+    description: "Fail if unresolved critical issues remain"
+    required: false
+    default: "false"
+  commit_message_prefix:
+    description: "Prefix for auto-commit messages"
+    required: false
+    default: "[aiops-sca]"
+  git_user_name:
+    description: "Git author name"
+    required: false
+    default: "aiops-sca[bot]"
+  git_user_email:
+    description: "Git author email"
+    required: false
+    default: "aiops-sca-bot@example.com"
+  temperature:
+    description: "LLM temperature"
+    required: false
+    default: "0.2"
+  max_tokens:
+    description: "LLM max tokens"
+    required: false
+    default: "4000"
+
+runs:
+  using: "docker"
+  image: "Dockerfile"
+  env:
+    GITHUB_TOKEN: ${{ github.token }}
