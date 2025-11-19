@@ -86,6 +86,48 @@ inputs:
     required: false
     default: "4000"
 
+  # New attributes
+  lint_retry_on_failure:
+    description: "Retry the LLM once if it returns invalid JSON"
+    required: false
+    default: "true"
+  re_lint_after_apply:
+    description: "Run a re-lint step after applying changes (requires re_lint_cmd)"
+    required: false
+    default: "false"
+  re_lint_cmd:
+    description: "Shell command to execute a linter after apply (it must output JSON files)"
+    required: false
+    default: ""
+  re_lint_output_glob:
+    description: "Glob pattern for the re-lint JSON outputs to parse"
+    required: false
+    default: ""
+  pr_title:
+    description: "PR title when apply_mode=pr"
+    required: false
+    default: "AIOps SCA: Auto-fix Terraform lint issues"
+  pr_body:
+    description: "PR body when apply_mode=pr"
+    required: false
+    default: "This PR was opened by AIOps SCA agent to address Terraform static analysis issues."
+  allow_severities:
+    description: 'JSON array of severities to consider (e.g., ["low","medium","high","critical","warning","error"])'
+    required: false
+    default: '["low","medium","high","critical","warning","error"]'
+  exclude_rules:
+    description: "JSON array of rule IDs to ignore"
+    required: false
+    default: "[]"
+  max_token_context_bytes:
+    description: "Skip files larger than this many bytes to avoid excessive prompts (0 disables)"
+    required: false
+    default: "0"
+  audit_log:
+    description: "Write prompt/response audit logs to output_dir/audit (secrets redacted)"
+    required: false
+    default: "true"
+
 runs:
   using: "docker"
   image: "Dockerfile"
