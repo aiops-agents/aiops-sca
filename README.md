@@ -3,6 +3,12 @@
 
 **Status:** Underconstruction. For any queries please reachout to @TheSolutionArchitect.
 
+**Plan A:**
+
+**name:** AIOps Static Code Analysis Agent
+**description:** "Agentic AI to analyze Terraform lint outputs and optionally auto-fix and push changes"
+
+
 **Usages**
 ```
 - name: AIOps SCA Agent
