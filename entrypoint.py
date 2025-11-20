@@ -112,7 +112,6 @@ def normalize_rule_id(v: Any) -> str:
     if isinstance(v, (int, float, bool)):
         return str(v)
     if isinstance(v, dict):
-        # Common keys seen across tools
         for key in ("id", "rule_id", "rule", "name", "code"):
             if key in v and isinstance(v[key], str):
                 return v[key]
@@ -148,7 +147,6 @@ def detect_lint_format(payload: Any) -> str:
     return "unknown"
 
 def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[Dict[str, Any]]:
-    # ignore if not a regular file
     if not os.path.isfile(path):
         gh_print(f"::notice::{path} is not a regular file. Skipping.")
         return []
@@ -238,7 +236,7 @@ def collect_issues(input_dir: str, lint_format: str) -> List[Dict[str, Any]]:
             issues.extend(normalize_issues_from_file(path, lint_format))
     return issues
 
-# --------- LLM client ---------
+# --------- LLM client + Azure Foundry fallback ---------
 
 def build_llm_client(provider: str):
     provider = provider.lower()
@@ -249,7 +247,13 @@ def build_llm_client(provider: str):
         if not endpoint or not key or not version:
             gh_print("::error::AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION env vars are required for azure_openai")
             sys.exit(1)
-        return AzureOpenAI(azure_endpoint=endpoint, api_key=key, api_version=version)
+        # Try SDK first; if endpoint looks like Foundry (ai.azure.com), we will auto-fallback to REST in llm_propose_new_content.
+        try:
+            client = AzureOpenAI(azure_endpoint=endpoint, api_key=key, api_version=version)
+        except Exception as e:
+            gh_print(f"::warning::AzureOpenAI SDK init failed: {e}. Will use REST fallback.")
+            client = None
+        return client
     elif provider == "openai":
         key = os.getenv("OPENAI_API_KEY")
         if not key:
@@ -259,6 +263,29 @@ def build_llm_client(provider: str):
     else:
         gh_print(f"::error::Unsupported llm_provider: {provider}")
         sys.exit(1)
+
+def azure_rest_chat_completion(model: str, messages: List[Dict[str, Any]], temperature: float, max_tokens: int) -> str:
+    endpoint = os.getenv("AZURE_OPENAI_ENDPOINT")
+    key = os.getenv("AZURE_OPENAI_API_KEY")
+    version = os.getenv("AZURE_OPENAI_API_VERSION")
+    if not endpoint or not key or not version:
+        raise RuntimeError("Missing AZURE_OPENAI_* env vars for Azure REST call")
+    endpoint = endpoint.rstrip("/")
+    url = f"{endpoint}/openai/deployments/{model}/chat/completions?api-version={version}"
+    headers = {
+        "api-key": key,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=90)
+    if resp.status_code != 200:
+        raise RuntimeError(f"Azure REST {resp.status_code}: {resp.text[:500]}")
+    data = resp.json()
+    return data["choices"][0]["message"]["content"]
 
 SYSTEM_PROMPT = """You are a principal DevOps/Terraform engineer and static analysis expert.
 - Goal: Given a Terraform file and lint issues, produce the minimal, safe corrections that resolve the issues without altering intent.
@@ -299,47 +326,81 @@ def parse_json_strict(s: str) -> Optional[Dict[str, Any]]:
 
 def llm_propose_new_content(client, provider: str, model: str, file_path: str, file_text: str, issues: List[Dict[str, Any]], temperature: float, max_tokens: int, audit: bool, output_dir: str, lint_retry: bool) -> Optional[Dict[str, Any]]:
     user_payload = {"file_path": file_path, "file_content": file_text, "issues": issues}
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)}]
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": json.dumps(user_payload, ensure_ascii=False)},
+    ]
     try:
+        content = None
         if provider == "azure_openai":
-            resp = client.chat.completions.create(model=model, temperature=temperature, max_tokens=max_tokens, messages=messages)
-            content = resp.choices[0].message.content
+            # Prefer SDK, fallback to REST if 404 or endpoint suggests Foundry.
+            endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").lower()
+            must_use_rest = "ai.azure.com" in endpoint  # Foundry endpoints commonly use ai.azure.com
+            last_err = None
+
+            if client is not None and not must_use_rest:
+                try:
+                    resp = client.chat.completions.create(model=model, temperature=temperature, max_tokens=max_tokens, messages=messages)
+                    content = resp.choices[0].message.content
+                except Exception as e:
+                    last_err = str(e)
+                    # If 404 or resource path mismatch, try REST
+                    if "404" in last_err or "Resource not found" in last_err:
+                        must_use_rest = True
+                    else:
+                        # Other errors (auth, quota, etc.) will be surfaced
+                        raise
+
+            if must_use_rest and content is None:
+                content = azure_rest_chat_completion(model=model, messages=messages, temperature=temperature, max_tokens=max_tokens)
+
         else:
-            resp = client.chat_completions.create(model=model, temperature=temperature, max_tokens=max_tokens, messages=messages) if hasattr(client, "chat_completions") else client.chat.completions.create(model=model, temperature=temperature, max_tokens=max_tokens, messages=messages)
+            # OpenAI (non-Azure)
+            if hasattr(client, "chat_completions"):
+                resp = client.chat_completions.create(model=model, temperature=temperature, max_tokens=max_tokens, messages=messages)
+            else:
+                resp = client.chat.completions.create(model=model, temperature=temperature, max_tokens=max_tokens, messages=messages)
             content = resp.choices[0].message.content
 
         if audit:
-            audit_write(output_dir, file_path, {"request": {"messages": messages, "model": model}, "response_raw": redact_secrets(content or "")})
+            audit_write(output_dir, file_path, {"request": {"messages": messages, "model": model, "provider": provider}, "response_raw": redact_secrets(content or "")})
 
         parsed = parse_json_strict(content or "")
         if not parsed and lint_retry:
             gh_print(f"::notice::Retrying LLM for {file_path} due to invalid JSON.")
+            # Retry once with temperature reduced
             if provider == "azure_openai":
-                resp = client.chat.completions.create(model=model, temperature=max(0.1, temperature - 0.1), max_tokens=max_tokens, messages=messages)
-                content = resp.choices[0].message.content
+                try:
+                    endpoint = (os.getenv("AZURE_OPENAI_ENDPOINT") or "").lower()
+                    if client is not None and "ai.azure.com" not in endpoint:
+                        resp = client.chat.completions.create(model=model, temperature=max(0.1, temperature - 0.1), max_tokens=max_tokens, messages=messages)
+                        content = resp.choices[0].message.content
+                    else:
+                        content = azure_rest_chat_completion(model=model, messages=messages, temperature=max(0.1, temperature - 0.1), max_tokens=max_tokens)
+                except Exception as e:
+                    gh_print(f"::warning::LLM retry failed for {file_path}: {e}")
+                    return None
             else:
                 resp = client.chat.completions.create(model=model, temperature=max(0.1, temperature - 0.1), max_tokens=max_tokens, messages=messages)
                 content = resp.choices[0].message.content
+
             if audit:
-                audit_write(output_dir, file_path, {"request_retry": {"messages": messages, "model": model}, "response_raw_retry": redact_secrets(content or "")})
+                audit_write(output_dir, file_path, {"request_retry": {"messages": messages, "model": model, "provider": provider}, "response_raw_retry": redact_secrets(content or "")})
             parsed = parse_json_strict(content or "")
+
         return parsed
     except Exception as e:
         msg = str(e)
-        if "404" in msg or "Resource not found" in msg:
-            if provider == "azure_openai":
+        if provider == "azure_openai":
+            if "404" in msg or "Resource not found" in msg:
                 gh_print(
                     f"::warning::LLM call failed for {file_path}: {msg}. "
-                    f"For Azure OpenAI, a 404 usually means the deployment name in llm_model ('{model}') "
-                    f"does not exist under AZURE_OPENAI_ENDPOINT or the API version is incorrect. "
-                    f"Ensure llm_model equals your Azure Deployment Name (not the base model ID), "
-                    f"and AZURE_OPENAI_API_VERSION matches what your deployment supports."
+                    f"For Azure, ensure llm_model equals your Deployment Name ('{model}'), "
+                    f"AZURE_OPENAI_ENDPOINT points to your resource or Foundry endpoint, "
+                    f"and AZURE_OPENAI_API_VERSION matches your deployed model (e.g., 2024-07-18)."
                 )
             else:
-                gh_print(
-                    f"::warning::LLM call failed for {file_path}: {msg}. "
-                    f"404 may indicate the model '{model}' is unavailable to your account or is misspelled."
-                )
+                gh_print(f"::warning::LLM call failed for {file_path}: {msg}")
         else:
             gh_print(f"::warning::LLM call failed for {file_path}: {msg}")
         return None
@@ -600,7 +661,7 @@ def main():
     input_dir = get_input("input_dir", "./input")
     output_dir = get_input("output_dir", "./output")
     llm_provider = get_input("llm_provider", "azure_openai")
-    llm_model = get_input("llm_model", required=True)
+    llm_model = get_input("llm_model", "gpt-4o-mini")
     show_recommendation = parse_bool(get_input("show_recommendation", "true"))
     auto_apply = parse_bool(get_input("auto_apply", "false"))
     lint_format = get_input("lint_format", "auto")
@@ -619,7 +680,6 @@ def main():
     lint_retry_on_failure = parse_bool(get_input("lint_retry_on_failure", "true"))
     allow_severities = [s.lower() for s in parse_json_or_csv(get_input("allow_severities", '["low","medium","high","critical","warning","error"]'))]
 
-    # Normalize exclude_rules to a set of strings
     exclude_rules_raw = parse_json_or_csv(get_input("exclude_rules", "[]"))
     exclude_rules: set[str] = set()
     for x in exclude_rules_raw:
@@ -657,6 +717,8 @@ def main():
 
     ensure_dir(output_dir)
 
+    gh_print(f"::notice::LLM provider={llm_provider}, model={llm_model}")
+
     # Gather initial issues
     issues_raw = collect_issues(input_dir, lint_format)
     issues = []
@@ -667,7 +729,6 @@ def main():
         rid_norm = normalize_rule_id(it.get("rule_id"))
         if rid_norm and rid_norm in exclude_rules:
             continue
-        # ensure rule_id is stored as string for downstream processing
         it["rule_id"] = rid_norm
         issues.append(it)
 
