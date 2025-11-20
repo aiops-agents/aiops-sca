@@ -39,7 +39,6 @@ inputs:
   llm_model:
     description: "Model or deployment name (e.g., gpt-4o-mini)"
     required: true
-    default: "gpt-4o-mini"
 
   show_recommendation:
     description: "Store human-readable recommendations"
@@ -123,7 +122,7 @@ inputs:
     default: '["low","medium","high","critical","warning","error"]'
 
   exclude_rules:
-    description: "JSON array of rule IDs to ignore"
+    description: "JSON array or CSV of rule IDs to ignore"
     required: false
     default: "[]"
 
