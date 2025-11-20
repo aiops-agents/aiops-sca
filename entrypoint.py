@@ -102,6 +102,31 @@ def repo_rel_path(p: str) -> str:
         pass
     return p.lstrip("./")
 
+# --------- Rule ID normalization ---------
+
+def normalize_rule_id(v: Any) -> str:
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    if isinstance(v, (int, float, bool)):
+        return str(v)
+    if isinstance(v, dict):
+        # Common keys seen across tools
+        for key in ("id", "rule_id", "rule", "name", "code"):
+            if key in v and isinstance(v[key], str):
+                return v[key]
+        try:
+            return json.dumps(v, sort_keys=True)
+        except Exception:
+            return str(v)
+    if isinstance(v, list):
+        try:
+            return json.dumps(v, sort_keys=True)
+        except Exception:
+            return ",".join([str(x) for x in v])
+    return str(v)
+
 # --------- Lint parsing ---------
 
 def _detect_lint_format_dict(d: Dict[str, Any]) -> str:
@@ -144,7 +169,7 @@ def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[D
         end = (r.get("end", {}) or {}).get("line", start)
         issues.append({
             "tool": "tflint",
-            "rule_id": it.get("rule", ""),
+            "rule_id": normalize_rule_id(it.get("rule")),
             "message": it.get("message", ""),
             "severity": (it.get("severity", "warning") or "").lower(),
             "file_path": repo_rel_path((r.get("filename", "") or "")),
@@ -158,7 +183,7 @@ def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[D
         end = loc.get("end_line", start)
         issues.append({
             "tool": "tfsec",
-            "rule_id": res.get("rule_id", ""),
+            "rule_id": normalize_rule_id(res.get("rule_id")),
             "message": res.get("description", ""),
             "severity": (res.get("severity", "medium") or "").lower(),
             "file_path": repo_rel_path((loc.get("filename", "") or "")),
@@ -177,7 +202,7 @@ def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[D
                 start, end = rng
             issues.append({
                 "tool": "checkov",
-                "rule_id": fc.get("check_id", ""),
+                "rule_id": normalize_rule_id(fc.get("check_id")),
                 "message": fc.get("check_name", ""),
                 "severity": (fc.get("severity", "medium") or "").lower(),
                 "file_path": repo_rel_path(fc.get("file_path") or fc.get("file_abs_path") or ""),
@@ -430,7 +455,7 @@ def issues_to_sarif(issues: List[Dict[str, Any]], run_name: str = "aiops-sca") -
         return idx
 
     for it in issues:
-        rule_idx = rule_for(it.get("rule_id", ""), it.get("tool", "lint"), it.get("message", ""))
+        rule_idx = rule_for(str(it.get("rule_id", "")), it.get("tool", "lint"), it.get("message", ""))
         path = (it.get("file_path") or "").replace("\\", "/")
         start = it.get("start_line") or 1
         end = it.get("end_line") or start
@@ -577,7 +602,16 @@ def main():
 
     lint_retry_on_failure = parse_bool(get_input("lint_retry_on_failure", "true"))
     allow_severities = [s.lower() for s in parse_json_or_csv(get_input("allow_severities", '["low","medium","high","critical","warning","error"]'))]
-    exclude_rules = set(parse_json_or_csv(get_input("exclude_rules", "[]")))
+
+    # Normalize exclude_rules to a set of strings
+    exclude_rules_raw = parse_json_or_csv(get_input("exclude_rules", "[]"))
+    exclude_rules: set[str] = set()
+    for x in exclude_rules_raw:
+        try:
+            exclude_rules.add(str(x).strip())
+        except Exception:
+            pass
+
     max_token_context_bytes = int(get_input("max_token_context_bytes", "0"))
     audit_log = parse_bool(get_input("audit_log", "true"))
 
@@ -614,8 +648,11 @@ def main():
         sev = (it.get("severity") or "").lower()
         if allow_severities and sev and sev not in allow_severities:
             continue
-        if it.get("rule_id") in exclude_rules:
+        rid_norm = normalize_rule_id(it.get("rule_id"))
+        if rid_norm and rid_norm in exclude_rules:
             continue
+        # ensure rule_id is stored as string for downstream processing
+        it["rule_id"] = rid_norm
         issues.append(it)
 
     gh_print(f"::notice::Collected {len(issues)} eligible lint issues from {input_dir} (filtered from {len(issues_raw)})")
@@ -649,6 +686,7 @@ def main():
                     dest = os.path.join(tool_sarif_dir, f"{tool}.sarif")
                     if copy_if_exists(native, dest):
                         gh_print(f"::notice::Copied native SARIF for {tool} -> {dest}")
+            # Convert for any tools without native SARIF present
             write_tool_sarif_convert(issues, tool_sarif_dir, suffix="pre")
         else:
             write_tool_sarif_convert(issues, tool_sarif_dir, suffix="pre")
