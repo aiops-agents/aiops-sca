@@ -325,7 +325,23 @@ def llm_propose_new_content(client, provider: str, model: str, file_path: str, f
             parsed = parse_json_strict(content or "")
         return parsed
     except Exception as e:
-        gh_print(f"::warning::LLM call failed for {file_path}: {e}")
+        msg = str(e)
+        if "404" in msg or "Resource not found" in msg:
+            if provider == "azure_openai":
+                gh_print(
+                    f"::warning::LLM call failed for {file_path}: {msg}. "
+                    f"For Azure OpenAI, a 404 usually means the deployment name in llm_model ('{model}') "
+                    f"does not exist under AZURE_OPENAI_ENDPOINT or the API version is incorrect. "
+                    f"Ensure llm_model equals your Azure Deployment Name (not the base model ID), "
+                    f"and AZURE_OPENAI_API_VERSION matches what your deployment supports."
+                )
+            else:
+                gh_print(
+                    f"::warning::LLM call failed for {file_path}: {msg}. "
+                    f"404 may indicate the model '{model}' is unavailable to your account or is misspelled."
+                )
+        else:
+            gh_print(f"::warning::LLM call failed for {file_path}: {msg}")
         return None
 
 # --------- Diff, patches, safety ---------
