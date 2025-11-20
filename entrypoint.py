@@ -6,6 +6,7 @@ import sys
 import subprocess
 import pathlib
 import difflib
+import shlex
 from typing import List, Dict, Any, Tuple, Optional
 import requests
 
@@ -85,19 +86,48 @@ def audit_write(output_dir: str, file_path: str, payload: Dict[str, Any]):
     except Exception as e:
         gh_print(f"::warning::Failed audit write for {file_path}: {e}")
 
+# --------- Path utils ---------
+
+GIT_WORKSPACE = os.getenv("GITHUB_WORKSPACE", os.getcwd())
+
+def repo_rel_path(p: str) -> str:
+    if not p:
+        return p
+    p = p.replace("\\", "/")
+    try:
+        if os.path.isabs(p):
+            rel = os.path.relpath(p, GIT_WORKSPACE).replace("\\", "/")
+            return rel
+    except Exception:
+        pass
+    return p.lstrip("./")
+
 # --------- Lint parsing ---------
+
+def _detect_lint_format_dict(d: Dict[str, Any]) -> str:
+    if "issues" in d and isinstance(d["issues"], list):
+        return "tflint"
+    if "results" in d and isinstance(d["results"], list) and any(isinstance(r, dict) and ("rule_id" in r or "rule" in r) for r in d["results"]):
+        return "tfsec"
+    if "check_type" in d and "results" in d:
+        return "checkov"
+    if "results" in d and isinstance(d["results"], dict) and "failed_checks" in d["results"]:
+        return "checkov"
+    return "unknown"
 
 def detect_lint_format(payload: Any) -> str:
     if isinstance(payload, dict):
-        if "issues" in payload and isinstance(payload["issues"], list):
-            return "tflint"
-        if "results" in payload and isinstance(payload["results"], list) and any(isinstance(r, dict) and ("rule_id" in r or "rule" in r) for r in payload["results"]):
-            return "tfsec"
-        if "check_type" in payload and "results" in payload:
-            return "checkov"
+        return _detect_lint_format_dict(payload)
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+        return _detect_lint_format_dict(payload[0])
     return "unknown"
 
 def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[Dict[str, Any]]:
+    # ignore if not a regular file
+    if not os.path.isfile(path):
+        gh_print(f"::notice::{path} is not a regular file. Skipping.")
+        return []
+
     try:
         with open(path, "r", encoding="utf-8") as f:
             payload = json.load(f)
@@ -106,39 +136,40 @@ def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[D
         return []
 
     fmt = detect_lint_format(payload) if forced_format == "auto" else forced_format
-    issues = []
-    if fmt == "tflint":
-        for it in payload.get("issues", []):
-            r = it.get("range", {}) or {}
-            start = (r.get("start", {}) or {}).get("line", None)
-            end = (r.get("end", {}) or {}).get("line", start)
-            issues.append({
-                "tool": "tflint",
-                "rule_id": it.get("rule", ""),
-                "message": it.get("message", ""),
-                "severity": (it.get("severity", "warning") or "").lower(),
-                "file_path": (r.get("filename", "") or "").lstrip("./"),
-                "start_line": start,
-                "end_line": end,
-            })
-    elif fmt == "tfsec":
-        for res in payload.get("results", []):
-            loc = res.get("location", {}) or {}
-            start = loc.get("start_line", None)
-            end = loc.get("end_line", start)
-            issues.append({
-                "tool": "tfsec",
-                "rule_id": res.get("rule_id", ""),
-                "message": res.get("description", ""),
-                "severity": (res.get("severity", "medium") or "").lower(),
-                "file_path": (loc.get("filename", "") or "").lstrip("./"),
-                "start_line": start,
-                "end_line": end,
-                "resolution": res.get("resolution", ""),
-                "impact": res.get("impact", ""),
-            })
-    elif fmt == "checkov":
-        res = payload.get("results", {}) or {}
+    issues: List[Dict[str, Any]] = []
+
+    def push_tflint(it: Dict[str, Any]):
+        r = it.get("range", {}) or {}
+        start = (r.get("start", {}) or {}).get("line", None)
+        end = (r.get("end", {}) or {}).get("line", start)
+        issues.append({
+            "tool": "tflint",
+            "rule_id": it.get("rule", ""),
+            "message": it.get("message", ""),
+            "severity": (it.get("severity", "warning") or "").lower(),
+            "file_path": repo_rel_path((r.get("filename", "") or "")),
+            "start_line": start,
+            "end_line": end,
+        })
+
+    def push_tfsec(res: Dict[str, Any]):
+        loc = res.get("location", {}) or {}
+        start = loc.get("start_line", None)
+        end = loc.get("end_line", start)
+        issues.append({
+            "tool": "tfsec",
+            "rule_id": res.get("rule_id", ""),
+            "message": res.get("description", ""),
+            "severity": (res.get("severity", "medium") or "").lower(),
+            "file_path": repo_rel_path((loc.get("filename", "") or "")),
+            "start_line": start,
+            "end_line": end,
+            "resolution": res.get("resolution", ""),
+            "impact": res.get("impact", ""),
+        })
+
+    def push_checkov_from_dict(d: Dict[str, Any]):
+        res = d.get("results", {}) or {}
         for fc in res.get("failed_checks", []):
             rng = fc.get("file_line_range")
             start, end = None, None
@@ -149,19 +180,37 @@ def normalize_issues_from_file(path: str, forced_format: str = "auto") -> List[D
                 "rule_id": fc.get("check_id", ""),
                 "message": fc.get("check_name", ""),
                 "severity": (fc.get("severity", "medium") or "").lower(),
-                "file_path": (fc.get("file_path", "") or "").lstrip("./"),
+                "file_path": repo_rel_path(fc.get("file_path") or fc.get("file_abs_path") or ""),
                 "start_line": start,
                 "end_line": end,
                 "guideline": fc.get("guideline", ""),
             })
+
+    if fmt == "tflint":
+        if isinstance(payload, dict):
+            for it in payload.get("issues", []):
+                push_tflint(it)
+    elif fmt == "tfsec":
+        if isinstance(payload, dict):
+            for res in payload.get("results", []):
+                push_tfsec(res)
+    elif fmt == "checkov":
+        if isinstance(payload, dict):
+            push_checkov_from_dict(payload)
+        elif isinstance(payload, list):
+            for d in payload:
+                if isinstance(d, dict):
+                    push_checkov_from_dict(d)
     else:
         gh_print(f"::notice::Unknown lint format in {path}. Skipping.")
     return issues
 
 def collect_issues(input_dir: str, lint_format: str) -> List[Dict[str, Any]]:
-    issues = []
-    for path in glob.glob(os.path.join(input_dir, "**/*.json"), recursive=True):
-        issues.extend(normalize_issues_from_file(path, lint_format))
+    issues: List[Dict[str, Any]] = []
+    search_root = os.path.join(input_dir, "**", "*")
+    for path in glob.glob(search_root, recursive=True):
+        if os.path.isfile(path) and path.endswith(".json"):
+            issues.extend(normalize_issues_from_file(path, lint_format))
     return issues
 
 # --------- LLM client ---------
@@ -401,7 +450,7 @@ def issues_to_sarif(issues: List[Dict[str, Any]], run_name: str = "aiops-sca") -
         "version": "2.1.0",
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "runs": [{
-            "tool": {"driver": {"name": run_name, "informationUri": "https://github.com/ai-agents/aiops-sca", "rules": rules}},
+            "tool": {"driver": {"name": run_name, "informationUri": "https://github.com/aiops-agents/aiops-sca", "rules": rules}},
             "results": results
         }]
     }
@@ -438,44 +487,61 @@ def copy_if_exists(src: str, dst: str) -> bool:
         gh_print(f"::warning::Failed to copy {src} -> {dst}: {e}")
     return False
 
+def find_native_sarif(input_dir: str, tool: str) -> Optional[str]:
+    patterns = [f"**/{tool}.sarif", f"**/*{tool}*.sarif"]
+    for pat in patterns:
+        for p in glob.glob(os.path.join(input_dir, pat), recursive=True):
+            if os.path.isfile(p):
+                return p
+    return None
+
 # --------- Built-in re-lint (JSON + optional native SARIF) ---------
 
 def run_cmd(cmd: str) -> Tuple[int, str, str]:
     p = subprocess.run(cmd, shell=True, text=True, capture_output=True)
     return p.returncode, p.stdout, p.stderr
 
-def run_builtin_relint(tools: List[str], output_dir: str, generate_native_sarif: bool, tool_sarif_post_dir: str) -> Dict[str, Any]:
-    relint_dir = os.path.join(output_dir, "re_lint")
+def run_builtin_relint(tools: List[str], output_dir: str, generate_native_sarif: bool, tool_sarif_post_dir: str, tf_root_dir: str) -> Dict[str, Any]:
+    relint_dir = os.path.abspath(os.path.join(output_dir, "re_lint"))
     ensure_dir(relint_dir)
+    ensure_dir(tool_sarif_post_dir)
     issues_all: List[Dict[str, Any]] = []
 
-    # TFLint JSON
+    root = tf_root_dir if tf_root_dir else "."
+    root_q = shlex.quote(root)
+
     if "tflint" in tools:
-        run_cmd(f"tflint --recursive --format json > {relint_dir}/tflint.json || true")
+        run_cmd(f"cd {root_q} && tflint --init || true")
+        run_cmd(f"cd {root_q} && tflint --recursive --format json > {shlex.quote(os.path.join(relint_dir, 'tflint.json'))} || true")
         issues_all += normalize_issues_from_file(os.path.join(relint_dir, "tflint.json"), "tflint")
         if generate_native_sarif:
-            # Try native SARIF; not all versions support it, fallback okay
-            code, _, err = run_cmd(f"tflint --recursive --format sarif > {pathlib.Path(tool_sarif_post_dir, 'tflint.sarif')} || true")
+            code, _, err = run_cmd(f"cd {root_q} && tflint --recursive --format sarif > {shlex.quote(os.path.join(tool_sarif_post_dir, 'tflint.sarif'))} || true")
             if code != 0 and err:
-                gh_print(f"::notice::tflint native SARIF may not be supported in this version; falling back to converted SARIF later.")
+                gh_print("::notice::tflint native SARIF may not be supported; will convert if needed.")
 
-    # tfsec JSON
     if "tfsec" in tools:
-        run_cmd(f"tfsec --format json --out {relint_dir}/tfsec.json || true")
+        run_cmd(f"tfsec {root_q} --format json --out {shlex.quote(os.path.join(relint_dir, 'tfsec.json'))} || true")
         issues_all += normalize_issues_from_file(os.path.join(relint_dir, "tfsec.json"), "tfsec")
         if generate_native_sarif:
-            run_cmd(f"tfsec --format sarif --out {pathlib.Path(tool_sarif_post_dir, 'tfsec.sarif')} || true")
+            run_cmd(f"tfsec {root_q} --format sarif --out {shlex.quote(os.path.join(tool_sarif_post_dir, 'tfsec.sarif'))} || true")
 
-    # Checkov JSON
     if "checkov" in tools:
-        run_cmd(f"checkov -d . -o json --output-file-path {relint_dir}/checkov.json || true")
-        if os.path.isfile(os.path.join(relint_dir, "checkov.json")):
-            issues_all += normalize_issues_from_file(os.path.join(relint_dir, "checkov.json"), "checkov")
+        run_cmd(f"checkov -d {root_q} -o json --output-file-path {shlex.quote(relint_dir)} || true")
+        direct_file = os.path.join(relint_dir, "checkov.json")
+        if os.path.isfile(direct_file):
+            issues_all += normalize_issues_from_file(direct_file, "checkov")
         else:
+            picked = False
             for p in glob.glob(os.path.join(relint_dir, "**/*.json"), recursive=True):
-                issues_all += normalize_issues_from_file(p, "checkov")
+                base = os.path.basename(p)
+                if base in ("results_json.json", "checkov_results.json"):
+                    issues_all += normalize_issues_from_file(p, "checkov")
+                    picked = True
+            if not picked:
+                for p in glob.glob(os.path.join(relint_dir, "**/*.json"), recursive=True):
+                    issues_all += normalize_issues_from_file(p, "checkov")
         if generate_native_sarif:
-            run_cmd(f"checkov -d . -o sarif --output-file-path {pathlib.Path(tool_sarif_post_dir, 'checkov.sarif')} || true")
+            run_cmd(f"checkov -d {root_q} -o sarif --output-file-path {shlex.quote(tool_sarif_post_dir)} || true")
 
     files = set([i.get("file_path") for i in issues_all if i.get("file_path")])
     return {"issues": len(issues_all), "files": len(files), "collected_issues": issues_all}
@@ -488,7 +554,8 @@ def main():
         gh_print("::notice::Agent disabled (enable=false). Exiting.")
         return
 
-    scope = parse_json_or_csv(get_input("scope", '["**/*.tf"]', required=True))
+    scope = parse_json_or_csv(get_input("scope", '["infra/**/*.tf"]', required=True))
+    tf_root_dir = get_input("tf_root_dir", "infra")
     input_dir = get_input("input_dir", "./input")
     output_dir = get_input("output_dir", "./output")
     llm_provider = get_input("llm_provider", "azure_openai")
@@ -521,7 +588,7 @@ def main():
 
     # Tool-specific SARIF
     tool_sarif_enabled = parse_bool(get_input("tool_sarif_enabled", "true"))
-    tool_sarif_mode = get_input("tool_sarif_mode", "convert").lower()  # pre-fix
+    tool_sarif_mode = get_input("tool_sarif_mode", "convert").lower()
     tool_sarif_dir = get_input("tool_sarif_dir", "output/sarif")
     tool_sarif_post_mode = get_input("tool_sarif_post_mode", "native").lower()
     tool_sarif_post_dir = get_input("tool_sarif_post_dir", "output/sarif-post")
@@ -559,14 +626,15 @@ def main():
     # Index issues by file (only files in scope)
     issues_by_file: Dict[str, List[Dict[str, Any]]] = {}
     for it in issues:
-        fp = (it.get("file_path") or "").lstrip("./")
+        fp = repo_rel_path(it.get("file_path") or "")
         if fp in files_in_scope_set:
             issues_by_file.setdefault(fp, []).append(it)
 
     # Aggregated SARIF pre-fix
     if sarif_output_enabled:
         pre = issues_to_sarif(issues)
-        pre_path = pathlib.Path(sarif_pre_path); ensure_dir(str(pre_path.parent))
+        pre_path = pathlib.Path(sarif_pre_path)
+        ensure_dir(str(pre_path.parent))
         with open(sarif_pre_path, "w", encoding="utf-8") as f:
             json.dump(pre, f, indent=2)
         gh_print(f"::notice::Wrote SARIF pre-fix to {sarif_pre_path}")
@@ -575,18 +643,12 @@ def main():
     if tool_sarif_enabled:
         ensure_dir(tool_sarif_dir)
         if tool_sarif_mode == "native":
-            # Attempt to copy native SARIF produced by previous steps; fallback to convert
-            found = False
-            mapping = {"tflint": ["tflint.sarif"], "tfsec": ["tfsec.sarif"], "checkov": ["checkov.sarif"]}
-            for tool, names in mapping.items():
-                copied = False
-                for name in names:
-                    if copy_if_exists(os.path.join(input_dir, name), os.path.join(tool_sarif_dir, f"{tool}.sarif")):
-                        gh_print(f"::notice::Copied native SARIF for {tool} -> {os.path.join(tool_sarif_dir, f'{tool}.sarif')}")
-                        copied = True; found = True; break
-                if not copied:
-                    gh_print(f"::notice::Native SARIF for {tool} not found in {input_dir}; will convert.")
-            # Convert for any not present
+            for tool in ["tflint", "tfsec", "checkov"]:
+                native = find_native_sarif(input_dir, tool)
+                if native:
+                    dest = os.path.join(tool_sarif_dir, f"{tool}.sarif")
+                    if copy_if_exists(native, dest):
+                        gh_print(f"::notice::Copied native SARIF for {tool} -> {dest}")
             write_tool_sarif_convert(issues, tool_sarif_dir, suffix="pre")
         else:
             write_tool_sarif_convert(issues, tool_sarif_dir, suffix="pre")
@@ -621,7 +683,16 @@ def main():
 
     # Propose & possibly apply per file
     for fp, file_issues in issues_by_file.items():
-        entry = {"file_path": fp, "status": "skipped", "reason": "", "risk_level": None, "total_edits": 0, "changes": [], "diff": "", "patch_path": ""}
+        entry = {
+            "file_path": fp,
+            "status": "skipped",
+            "reason": "",
+            "risk_level": None,
+            "total_edits": 0,
+            "changes": [],
+            "diff": "",
+            "patch_path": ""
+        }
         if is_protected(fp):
             entry["reason"] = "protected_path"
             fix_plan["entries"].append(entry)
@@ -644,10 +715,17 @@ def main():
             continue
 
         resp = llm_propose_new_content(
-            client=client, provider=llm_provider, model=llm_model,
-            file_path=fp, file_text=original, issues=file_issues,
-            temperature=temperature, max_tokens=max_tokens,
-            audit=audit_log, output_dir=output_dir, lint_retry=lint_retry_on_failure,
+            client=client,
+            provider=llm_provider,
+            model=llm_model,
+            file_path=fp,
+            file_text=original,
+            issues=file_issues,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            audit=audit_log,
+            output_dir=output_dir,
+            lint_retry=lint_retry_on_failure,
         )
 
         if not resp or "new_content" not in resp:
@@ -708,7 +786,6 @@ def main():
                 gh_print(f"::warning::Failed to write changes for {fp}: {e}")
                 continue
         else:
-            # Save proposed file for review
             proposal_path = os.path.join(output_dir, f"{pathlib.Path(fp).name}.proposed.tf")
             with open(proposal_path, "w", encoding="utf-8") as f:
                 f.write(new_content)
@@ -763,18 +840,22 @@ def main():
             except Exception as e:
                 gh_print(f"::error::Failed to push changes: {e}")
             if apply_mode == "pr" and created_branch and created_branch != current_branch:
-                pr_url = create_pull_request(base_branch=current_branch, head_branch=created_branch, title="AIOps SCA: Auto-fix Terraform lint issues", body="This PR was opened by AIOps SCA agent to address Terraform static analysis issues.")
+                pr_url = create_pull_request(
+                    base_branch=current_branch,
+                    head_branch=created_branch,
+                    title="AIOps SCA: Auto-fix Terraform lint issues",
+                    body="This PR was opened by AIOps SCA agent to address Terraform static analysis issues."
+                )
 
     # Re-lint
     relint_summary = None
     if re_lint_after_apply:
         if re_lint_tooling == "built-in":
-            ensure_dir(tool_sarif_post_dir)
             generate_native_sarif = (tool_sarif_post_mode == "native")
-            relint_summary = run_builtin_relint(re_lint_tools, output_dir, generate_native_sarif, tool_sarif_post_dir)
-            # For any tool SARIF not produced natively, convert from collected issues
+            relint_summary = run_builtin_relint(
+                re_lint_tools, output_dir, generate_native_sarif, tool_sarif_post_dir, tf_root_dir
+            )
             if tool_sarif_enabled:
-                # Check which SARIF files exist; convert missing ones
                 split = tool_split_issues(relint_summary["collected_issues"])
                 for tool in ["tflint", "tfsec", "checkov"]:
                     dest = os.path.join(tool_sarif_post_dir, f"{tool}.sarif")
@@ -792,9 +873,13 @@ def main():
                 new_issues = []
                 if re_lint_output_glob.strip():
                     for path in glob.glob(re_lint_output_glob.strip(), recursive=True):
-                        new_issues.extend(normalize_issues_from_file(path, lint_format))
-                relint_summary = {"issues": len(new_issues), "files": len(set([i.get("file_path") for i in new_issues if i.get("file_path")])), "collected_issues": new_issues}
-                # Convert per-tool SARIF post-fix if enabled
+                        if os.path.isfile(path):
+                            new_issues.extend(normalize_issues_from_file(path, lint_format))
+                relint_summary = {
+                    "issues": len(new_issues),
+                    "files": len(set([i.get("file_path") for i in new_issues if i.get("file_path")])),
+                    "collected_issues": new_issues
+                }
                 if tool_sarif_enabled:
                     write_tool_sarif_convert(new_issues, tool_sarif_post_dir, suffix="post")
             else:
@@ -803,7 +888,8 @@ def main():
     # Aggregated SARIF post-fix
     if sarif_output_enabled and relint_summary and isinstance(relint_summary.get("collected_issues"), list):
         post = issues_to_sarif(relint_summary["collected_issues"])
-        post_path = pathlib.Path(sarif_post_path); ensure_dir(str(post_path.parent))
+        post_path = pathlib.Path(sarif_post_path)
+        ensure_dir(str(post_path.parent))
         with open(sarif_post_path, "w", encoding="utf-8") as f:
             json.dump(post, f, indent=2)
         gh_print(f"::notice::Wrote SARIF post-fix to {sarif_post_path}")
@@ -846,15 +932,22 @@ def main():
     # Fix plan
     with open(os.path.join(output_dir, "fix_plan.json"), "w", encoding="utf-8") as f:
         json.dump(fix_plan, f, indent=2)
-    # Optional Markdown
-    lines = ["# AIOps SCA Fix Plan", f"- Files considered: {fix_plan['summary']['files_considered']}", f"- Files applied: {fix_plan['summary']['files_applied']}", f"- Files skipped: {fix_plan['summary']['files_skipped']}"]
+    lines = [
+        "# AIOps SCA Fix Plan",
+        f"- Files considered: {fix_plan['summary']['files_considered']}",
+        f"- Files applied: {fix_plan['summary']['files_applied']}",
+        f"- Files skipped: {fix_plan['summary']['files_skipped']}"
+    ]
     for e in fix_plan["entries"]:
         lines.append(f"## {e['file_path']}")
         lines.append(f"- Status: {e['status']}")
-        if e.get("reason"): lines.append(f"- Reason: {e['reason']}")
-        if e.get("risk_level"): lines.append(f"- Risk: {e['risk_level']}")
+        if e.get("reason"):
+            lines.append(f"- Reason: {e['reason']}")
+        if e.get("risk_level"):
+            lines.append(f"- Risk: {e['risk_level']}")
         lines.append(f"- Estimated edits: {e.get('total_edits', 0)}")
-        if e.get("patch_path"): lines.append(f"- Patch: {e['patch_path']}")
+        if e.get("patch_path"):
+            lines.append(f"- Patch: {e['patch_path']}")
         if e.get("changes"):
             lines.append("- Changes:")
             for c in e["changes"]:
