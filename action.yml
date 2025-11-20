@@ -38,7 +38,7 @@ inputs:
 
   llm_model:
     description: "Model or deployment name (e.g., gpt-4o-mini)"
-    required: true
+    required: false
     default: "gpt-4o-mini"
 
   show_recommendation:
