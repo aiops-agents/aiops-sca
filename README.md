@@ -45,3 +45,14 @@
     AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
     AZURE_OPENAI_API_VERSION: "2024-06-01"
 ```
+
+## Connect to OpenAI: Microsoft Foundry model deployment
+
+```
+endpoint = "https://aiops-az-openai.cognitiveservices.azure.com/"
+model_name = "gpt-4o-mini"
+deployment = "gpt-4o-mini"
+
+subscription_key = "<your-api-key>"
+api_version = "2024-12-01-preview"
+```
